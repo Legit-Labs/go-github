@@ -170,9 +170,10 @@ type Client struct {
 	// User agent used when communicating with the GitHub API.
 	UserAgent string
 
-	rateMu                  sync.Mutex
-	rateLimits              [categories]Rate // Rate limits for the client as determined by the most recent API calls.
-	secondaryRateLimitReset time.Time        // Secondary rate limit reset for the client as determined by the most recent API calls.
+	rateMu                     sync.Mutex
+	rateLimits                 [categories]Rate               // Rate limits for the client as determined by the most recent API calls.
+	secondaryRateLimitReset    time.Time                      // Secondary rate limit reset for the client as determined by the most recent API calls.
+	secondaryRateLimitCallback secondaryRateLimitCallbackType // Optional callback to replace the default handling for secondary rate limits.
 
 	common service // Reuse a single struct instead of allocating one for each service on the heap.
 
@@ -302,11 +303,20 @@ func addOptions(s string, opts interface{}) (string, error) {
 	return u.String(), nil
 }
 
+type clientOption func(*Client)
+type secondaryRateLimitCallbackType func(ctx context.Context, secondaryResetTime time.Time, req *http.Request) *AbuseRateLimitError
+
+func WithSecondaryRateLimitCallback(callback secondaryRateLimitCallbackType) clientOption {
+	return func(c *Client) {
+		c.secondaryRateLimitCallback = callback
+	}
+}
+
 // NewClient returns a new GitHub API client. If a nil httpClient is
 // provided, a new http.Client will be used. To use API methods which require
 // authentication, provide an http.Client that will perform the authentication
 // for you (such as that provided by the golang.org/x/oauth2 library).
-func NewClient(httpClient *http.Client) *Client {
+func NewClient(httpClient *http.Client, opts ...clientOption) *Client {
 	if httpClient == nil {
 		httpClient = &http.Client{}
 	}
@@ -314,6 +324,10 @@ func NewClient(httpClient *http.Client) *Client {
 	uploadURL, _ := url.Parse(uploadBaseURL)
 
 	c := &Client{client: httpClient, BaseURL: baseURL, UserAgent: defaultUserAgent, UploadURL: uploadURL}
+	for _, option := range opts {
+		option(c)
+	}
+
 	c.common.client = c
 	c.Actions = (*ActionsService)(&c.common)
 	c.Activity = (*ActivityService)(&c.common)
@@ -680,6 +694,7 @@ type requestContext uint8
 
 const (
 	bypassRateLimitCheck requestContext = iota
+	secondaryRateLimitCallback
 )
 
 // BareDo sends an API request and lets you handle the api response. If an error
@@ -708,7 +723,7 @@ func (c *Client) BareDo(ctx context.Context, req *http.Request) (*Response, erro
 			}, err
 		}
 		// If we've hit a secondary rate limit, don't make further requests before Retry After.
-		if err := c.checkSecondaryRateLimitBeforeDo(req); err != nil {
+		if err := c.checkSecondaryRateLimitBeforeDo(ctx, req); err != nil {
 			return &Response{
 				Response: err.Response,
 			}, err
@@ -839,10 +854,14 @@ func (c *Client) checkRateLimitBeforeDo(req *http.Request, rateLimitCategory rat
 // current client state in order to quickly check if *AbuseRateLimitError can be immediately returned
 // from Client.Do, and if so, returns it so that Client.Do can skip making a network API call unnecessarily.
 // Otherwise it returns nil, and Client.Do should proceed normally.
-func (c *Client) checkSecondaryRateLimitBeforeDo(req *http.Request) *AbuseRateLimitError {
+func (c *Client) checkSecondaryRateLimitBeforeDo(ctx context.Context, req *http.Request) *AbuseRateLimitError {
 	c.rateMu.Lock()
 	secondary := c.secondaryRateLimitReset
 	c.rateMu.Unlock()
+
+	if c.secondaryRateLimitCallback != nil {
+		return c.secondaryRateLimitCallback(ctx, secondary, req)
+	}
 
 	if secondary.After(time.Now()) {
 		// Create a fake response.
